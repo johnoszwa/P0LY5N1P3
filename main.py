@@ -5,6 +5,12 @@ import os
 from datetime import datetime
 from engine import score_signal, decide
 from tracker import get_bias, log_trade
+from risk_manager import (
+    calculate_position_size,
+    check_stop_loss,
+    record_capital_after_trade,
+    get_current_capital
+)
 
 # =========================
 # 🔐 TELEGRAM CONFIG (PUT YOUR TOKEN HERE)
@@ -60,7 +66,7 @@ def open_position(market, side, entry_price, size_usd, score, decision):
     send(msg)
     print(msg)
 
-def close_position(market, exit_price, outcome):
+def close_position(market, exit_price, outcome, stop_loss=False):
     positions = []
     closed = None
     with open(POSITIONS_FILE, "r") as f:
@@ -84,7 +90,7 @@ def close_position(market, exit_price, outcome):
     else:  # NO
         # entry stored as YES price; effective NO entry = 1 - entry
         entry_no = 1 - entry
-        # exit_price is final YES price (1 or 0)
+        # exit_price is final YES price (1 or 0) or current price for stop-loss
         exit_no = 1 - exit_price
         pnl = size * (exit_no - entry_no) / entry_no
 
@@ -103,7 +109,12 @@ def close_position(market, exit_price, outcome):
         writer.writerow(["market", "side", "entry_price", "size_usd", "entry_time", "score", "decision"])
         writer.writerows([list(p.values()) for p in positions])
 
-    msg = f"📄 PAPER CLOSE | {market} | {outcome} | PnL: ${pnl}"
+    # Update paper capital
+    new_capital = record_capital_after_trade(pnl)
+
+    msg = f"📄 PAPER CLOSE | {market} | {outcome} | PnL: ${pnl} | Balance: ${new_capital}"
+    if stop_loss:
+        msg = f"🛑 STOP-LOSS | {market} | Loss: ${pnl} | Balance: ${new_capital}"
     send(msg)
     print(msg)
     return pnl
@@ -151,8 +162,12 @@ def get_current_yes_price(market_id):
 # MAIN LOOP
 # =========================
 def run():
-    print("🧠 P0ly5n1p3 v5.3 PAPER TRADING SYSTEM (LIVE DATA)")
+    print("🧠 P0ly5n1p3 v5.3 PAPER TRADING SYSTEM (LIVE DATA + RISK MGMT)")
     init_files()
+
+    # Show starting capital
+    capital = get_current_capital()
+    send(f"🧠 P0ly5n1p3 v5.3 STARTING | Paper balance: ${capital} | Risk per trade: 2% | Stop-loss: 15%")
 
     while True:
         markets = fetch_markets()
@@ -161,17 +176,34 @@ def run():
             time.sleep(30)
             continue
 
-        # 1. Check resolution for all open positions
+        # 1. Check stop-loss for all open positions using current prices
         open_positions = get_open_positions()
         for pos in open_positions:
             market_name = pos["market"]
-            # Find market object by question text
+            # Find current market data
+            market_obj = next((m for m in markets if m.get("question") == market_name), None)
+            if market_obj and not market_obj.get("resolved", False):
+                try:
+                    current_yes_price = float(market_obj["outcomes"][0]["price"]) * 100
+                    should_close, pnl_pct, side, entry, size = check_stop_loss(market_name, current_yes_price)
+                    if should_close:
+                        # Close as stop-loss
+                        close_position(market_name, current_yes_price, "LOSS", stop_loss=True)
+                        # Also log to bias tracker
+                        log_trade(market_name, pos["score"], pos["decision"], "LOSS", None)
+                except Exception as e:
+                    print(f"Error checking stop-loss for {market_name}: {e}")
+                    continue
+
+        # 2. Check resolution for all open positions (normal close)
+        open_positions = get_open_positions()  # refresh after potential stop-loss closes
+        for pos in open_positions:
+            market_name = pos["market"]
             market_obj = next((m for m in markets if m.get("question") == market_name), None)
             if not market_obj:
                 continue
             resolved, outcome_yes = is_market_resolved(market_obj)
             if resolved:
-                # outcome_yes is typically 1 if YES wins, 0 if NO wins
                 exit_price = 100.0 if outcome_yes == 1 else 0.0
                 # Determine trade outcome
                 side = pos["side"]
@@ -180,23 +212,21 @@ def run():
                 else:
                     trade_outcome = "LOSS"
                 close_position(market_name, exit_price, trade_outcome)
-                # Also log to tracker's data.csv for bias learning
-                log_trade(market_name, pos["score"], pos["decision"], trade_outcome, None)  # pnl handled separately
+                # Log to bias tracker
+                log_trade(market_name, pos["score"], pos["decision"], trade_outcome, None)
 
-        # 2. Generate new signals for unresolved markets
+        # 3. Generate new signals for unresolved markets
         for m in markets[:20]:  # limit to 20 per cycle
             try:
                 if m.get("resolved", False):
                     continue
 
                 name = m["question"]
-                # Ensure outcomes exist
                 if "outcomes" not in m or len(m["outcomes"]) < 2:
                     continue
                 yes_price = float(m["outcomes"][0]["price"]) * 100
                 volume = m.get("volume", "Low")
-                # Simple momentum proxy
-                change = yes_price - 50
+                change = yes_price - 50  # momentum proxy
 
                 bias = get_bias(name)
                 score = score_signal(change, yes_price, volume, bias)
@@ -204,14 +234,19 @@ def run():
 
                 # Trade only if score >= 4 (TRADE or STRONG_TRADE)
                 if decision in ("TRADE", "STRONG_TRADE"):
-                    # Avoid duplicate positions on same market
+                    # Avoid duplicate positions
                     if any(p["market"] == name for p in get_open_positions()):
                         continue
 
                     # Simple side logic: if YES price < 50, buy YES; else buy NO
-                    # (You can replace with your own strategy)
                     side = "YES" if yes_price < 50 else "NO"
-                    size_usd = 10.0  # fixed paper size (can be adjusted)
+                    size_usd = calculate_position_size(yes_price, side)
+
+                    # Ensure we have enough capital (should be fine with risk %)
+                    capital = get_current_capital()
+                    if size_usd > capital * 0.95:  # safety: don't use more than 95% of capital
+                        print(f"Insufficient capital to open {name}: need ${size_usd}, have ${capital}")
+                        continue
 
                     open_position(name, side, yes_price, size_usd, score, decision)
 
